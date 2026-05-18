@@ -64,7 +64,8 @@ class MultiDataEvent(Generic[T]):
         return self._ready.wait(timeout)
 
     def register(self, item: T) -> None:
-        self._items.append(item)
+        if item not in self._items:
+            self._items.append(item)
         self._ready.set()
 
     def unregister(self, item: T) -> None:

@@ -64,16 +64,31 @@ class PacketRouter(threading.Thread):
         self._lock: threading.RLock = threading.RLock()
         self._end_thread: threading.Event = threading.Event()
         self._dropped_ssrcs: deque[int] = deque(maxlen=16)
+        self._sync_pcm: bool = not sink.is_opus()
 
     def feed_rtp(self, packet: RTPPacket) -> None:
         if packet.ssrc in self._dropped_ssrcs:
             _log.debug("Ignoring packet from dropped ssrc %s", packet.ssrc)
             return
 
+        if self._sync_pcm:
+            self._feed_rtp_sync(packet)
+            return
+
         with self._lock:
             decoder = self.get_decoder(packet.ssrc)
-            if decoder is not None:
-                decoder.push_packet(packet)
+            decoder.push_packet(packet)
+        self.waiter.notify()
+
+    def _feed_rtp_sync(self, packet: RTPPacket) -> None:
+        with self._lock:
+            decoder = self.get_decoder(packet.ssrc)
+            decoder.push_packet(packet)
+            rtp = decoder.pop_packet()
+
+        if rtp is not None:
+            data = decoder._process_packet(rtp)
+            self.sink.write(data, data.source)
 
     def feed_rtcp(self, packet: RTCPPacket) -> None:
         guild = self.sink.client.guild if self.sink.client else None
@@ -90,6 +105,7 @@ class PacketRouter(threading.Thread):
     def set_sink(self, sink: Sink) -> None:
         with self._lock:
             self.sink = sink
+            self._sync_pcm = not sink.is_opus()
 
     def set_user_id(self, ssrc: int, user_id: int) -> None:
         with self._lock:
@@ -131,14 +147,44 @@ class PacketRouter(threading.Thread):
             self.waiter.clear()
 
     def _do_run(self) -> None:
+        if self._sync_pcm:
+            self._end_thread.wait()
+            return
+
         while not self._end_thread.is_set():
             self.waiter.wait()
+            while self._drain_ready() and not self._end_thread.is_set():
+                pass
 
-            with self._lock:
-                for decoder in self.waiter.items:
-                    data = decoder.pop_data()
-                    if data is not None:
-                        self.sink.write(data, data.source)
+    def _pop_decoder_packets(
+        self, decoder: PacketDecoder
+    ) -> list[tuple[PacketDecoder, RTPPacket]]:
+        queued: list[tuple[PacketDecoder, RTPPacket]] = []
+        while True:
+            rtp = decoder.pop_packet()
+            if rtp is None:
+                break
+            queued.append((decoder, rtp))
+        return queued
+
+    def _write_packets(
+        self, queued: list[tuple[PacketDecoder, RTPPacket]]
+    ) -> None:
+        for decoder, rtp in queued:
+            data = decoder._process_packet(rtp)
+            self.sink.write(data, data.source)
+
+    def _drain_ready(self) -> bool:
+        queued: list[tuple[PacketDecoder, RTPPacket]] = []
+        with self._lock:
+            for decoder in self.waiter.items:
+                queued.extend(self._pop_decoder_packets(decoder))
+
+        if not queued:
+            return False
+
+        self._write_packets(queued)
+        return True
 
     def _drain_all_decoders(self) -> None:
         with self._lock:

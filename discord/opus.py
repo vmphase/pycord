@@ -579,10 +579,7 @@ class PacketDecoder:
         self.ssrc: int = ssrc
 
         self._decoder: Decoder | None = None if self.sink.is_opus() else Decoder()
-
-        from discord.voice.utils.buffer import JitterBuffer
-
-        self._buffer: JitterBuffer = JitterBuffer()
+        self._buffer = self._make_buffer()
         self._cached_id: int | None = None
 
         self._last_seq: int = -1
@@ -600,6 +597,8 @@ class PacketDecoder:
         return self._get_user(self._cached_id) if self._cached_id else None
 
     def _flag_ready_state(self) -> None:
+        if self.router._sync_pcm:
+            return
         if self._buffer.is_ready():
             self.router.waiter.register(self)
         else:
@@ -609,10 +608,13 @@ class PacketDecoder:
         self._buffer.push(packet)
         self._flag_ready_state()
 
-    def pop_data(self, *, timeout: float = 0) -> VoiceData | None:
+    def pop_packet(self, *, timeout: float = 0) -> Packet | None:
         packet = self._get_next_packet(timeout)
         self._flag_ready_state()
+        return packet
 
+    def pop_data(self, *, timeout: float = 0) -> VoiceData | None:
+        packet = self.pop_packet(timeout=timeout)
         if packet is None:
             return None
         return self._process_packet(packet)
@@ -620,19 +622,27 @@ class PacketDecoder:
     def set_user_id(self, user_id: int) -> None:
         self._cached_id = user_id
 
+    def _make_buffer(self):
+        from discord.voice.utils.buffer import JitterBuffer
+        return JitterBuffer()
+
     def reset(self) -> None:
-        self._buffer.reset()
+        self._buffer = self._make_buffer()
         self._decoder = None if self.sink.is_opus() else Decoder()
         self._last_seq = self._last_ts = -1
         self._flag_ready_state()
 
     def destroy(self) -> None:
-        self._buffer.reset()
+        self._buffer = self._make_buffer()
         self._decoder = None
         self._flag_ready_state()
 
     def _get_next_packet(self, timeout: float) -> Packet | None:
-        return self._buffer.pop(timeout=timeout)
+        packet = self._buffer.pop(timeout=timeout)
+        if packet is None and self._buffer.peek(all=True):
+            packets = self._buffer.flush()
+            return packets[0] if packets else None
+        return packet
 
     def _process_packet(self, packet: Packet) -> VoiceData:
         _log.debug("Processing packet %s", packet)
